@@ -112,3 +112,73 @@ export function parseApplyPatch(patch: string): PatchFile[] | null {
 
   return files.length > 0 ? files : null;
 }
+
+// Parse a standard unified diff (`@@ -a,b +c,d @@` with +/-/context lines) into the
+// same per-file, per-hunk structure as `parseApplyPatch`.
+//
+// This is the shape Codex Desktop v0.153+ records in
+// `event_msg.item_completed` → `FileChange` → `changes[path].unified_diff`. The
+// response_item side of a Desktop session holds the JavaScript the model ran, not a
+// patch body, so the runtime's own record is the only reliable diff source there.
+export function parseUnifiedDiff(
+  diff: string,
+  fallbackPath: string,
+  fallbackOp: PatchFileOp = "update",
+  movePath: string | null = null,
+): PatchFile[] | null {
+  if (!diff.includes("@@")) return null;
+
+  const lines = diff.split(/\r?\n/);
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+
+  const files: PatchFile[] = [];
+  let path = "";
+  let op: PatchFileOp = fallbackOp;
+  let sawHeader = false;
+  let hunkOps: LineOp[] = [];
+  let hunkHeader = "";
+
+  const endHunk = () => {
+    if (hunkOps.length > 0) {
+      if (!path) path = fallbackPath;
+      let file = files[files.length - 1];
+      if (!file || file.path !== path || sawHeader) {
+        // A `+++` header starts a new file section; otherwise a new hunk in the
+        // current file continues appending to it.
+        if (!file || file.path !== path) {
+          file = { path, op, movePath, hunks: [] };
+          files.push(file);
+        }
+      }
+      file.hunks.push({ header: hunkHeader, lines: segmentize(groupRuns(hunkOps)) });
+      sawHeader = false;
+    }
+    hunkOps = [];
+    hunkHeader = "";
+  };
+
+  for (const raw of lines) {
+    if (raw.startsWith("--- ") || raw === "---") continue; // old-file header carries no useful path
+    if (raw.startsWith("+++ ")) {
+      endHunk();
+      const newPath = raw.slice(4).trim();
+      path = newPath === "/dev/null" ? "" : newPath;
+      op = fallbackOp;
+      sawHeader = true;
+      continue;
+    }
+    if (raw.startsWith("@@")) {
+      endHunk();
+      hunkHeader = raw.trim();
+      continue;
+    }
+    if (raw.startsWith("+")) hunkOps.push({ kind: "added", text: raw.slice(1) });
+    else if (raw.startsWith("-")) hunkOps.push({ kind: "removed", text: raw.slice(1) });
+    else if (raw.startsWith(" ")) hunkOps.push({ kind: "context", text: raw.slice(1) });
+    else if (raw === "") hunkOps.push({ kind: "context", text: "" }); // blank context line
+    // Anything else (e.g. `\ No newline at end of file`) is metadata, not content.
+  }
+  endHunk();
+
+  return files.length > 0 ? files : null;
+}

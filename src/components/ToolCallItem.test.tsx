@@ -300,6 +300,78 @@ describe("ToolCallItem", () => {
     expect(container.querySelector(".tool-call__patch-file")!.textContent).toContain("src/main.rs");
   });
 
+  it("renders a structured diff from patch_changes unified_diff (Codex Desktop v0.153+)", () => {
+    // Desktop records the diff in `event_msg.item_completed` → FileChange, and the
+    // response_item side holds the JavaScript the model ran. `patch_changes` is therefore
+    // the only reliable diff source for these sessions.
+    const { container } = render(
+      <ToolCallItem
+        tool={makeTool({
+          kind: "patch_apply",
+          name: "apply_patch",
+          input_text: null,
+          command: null,
+          exit_code: null,
+          patch_changes: {
+            "docs/x.md": {
+              type: "update",
+              move_path: null,
+              unified_diff: "@@ -1,2 +1,3 @@\n keep\n-old\n+new\n+extra",
+            },
+          },
+        })}
+        expanded={true}
+        onToggle={vi.fn()}
+      />,
+    );
+    expect(container.querySelector(".tool-call__patch-file")!.textContent).toContain("docs/x.md");
+    expect(container.querySelector(".tool-call__diff-line--removed")!.textContent).toContain("old");
+    expect(container.querySelector(".tool-call__diff-line--added")!.textContent).toContain("new");
+  });
+
+  it("prefers patch_changes over a JavaScript input_text that wraps a patch", () => {
+    // Real Desktop sessions put the patch inside a JS string literal, which parseApplyPatch
+    // cannot structure. The runtime record must win even when input_text is present.
+    const { container } = render(
+      <ToolCallItem
+        tool={makeTool({
+          kind: "patch_apply",
+          name: "exec",
+          command: null,
+          exit_code: null,
+          input_text:
+            'const patch = "*** Begin Patch\\n*** Update File: a.md\\n@@\\n-x\\n+y\\n*** End Patch";',
+          patch_changes: {
+            "a.md": { type: "update", unified_diff: "@@ -1 +1 @@\n-x\n+y" },
+          },
+        })}
+        expanded={true}
+        onToggle={vi.fn()}
+      />,
+    );
+    // One file entry for the real change, not two from a partial apply_patch parse.
+    expect(container.querySelectorAll(".tool-call__patch-file")).toHaveLength(1);
+    expect(container.querySelector(".tool-call__diff-line--added")!.textContent).toContain("y");
+  });
+
+  it("falls back to input_text when patch_changes has no diff and no hunks parse", () => {
+    const { container } = render(
+      <ToolCallItem
+        tool={makeTool({
+          kind: "patch_apply",
+          name: "apply_patch",
+          command: null,
+          exit_code: null,
+          input_text: "*** Begin Patch\n*** Update File: b.md\n@@\n-1\n+2\n*** End Patch",
+          patch_changes: null,
+        })}
+        expanded={true}
+        onToggle={vi.fn()}
+      />,
+    );
+    expect(container.querySelector(".tool-call__diff-line--added")!.textContent).toContain("2");
+  });
+
   it("renders a structured red/green diff from an apply_patch input_text", () => {
     const patch = [
       "*** Begin Patch",

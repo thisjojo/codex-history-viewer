@@ -279,9 +279,182 @@ pub fn build_turns(entries: &[RawEntry]) -> Vec<CodexTurn> {
         }
     }
 
+    // Codex Desktop v0.153+ writes tool activity to a second stream
+    // (`event_msg.item_completed`) alongside `response_item`. Fold those items into the tool
+    // calls finalized above so the runtime's own record — parsed command, exit code, stdout,
+    // stderr, and `FileChange` unified diffs — reaches the turn instead of being dropped.
+    // This runs after finalization because an item may classify a call that `drain_pending`
+    // only just materialized.
+    fold_desktop_items(entries, &mut turns, &call_order);
+
     let mut result: Vec<CodexTurn> = turns.into_values().collect();
     result.sort_by_key(|t| t.started_at.unwrap_or(0));
     result
+}
+
+/// Correlate `event_msg.item_completed` items with the tool calls built from `response_item`.
+///
+/// Desktop emits the two representations adjacent to each other (measured on 60 real sessions:
+/// 1510 of 1512 mappable items sit exactly one JSONL line away from their tool call), so
+/// adjacency is used as the join key: an item is attached to the nearest tool-call entry that
+/// belongs to the same turn and has a 0/1 entry-index offset. Items whose type carries no tool
+/// activity (`Reasoning` / `AgentMessage` / `UserMessage` / `ContextCompaction` /
+/// `SubAgentActivity` / `CollabAgentToolCall`) are skipped — those are already represented by
+/// dedicated parser paths, and mapping them here would duplicate content.
+fn fold_desktop_items(
+    entries: &[RawEntry],
+    turns: &mut indexmap::IndexMap<String, CodexTurn>,
+    call_order: &HashMap<String, usize>,
+) {
+    // (entry index, item payload) for every item that maps onto tool activity.
+    let mut items: Vec<(usize, Value)> = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.entry_type != "event_msg" {
+            continue;
+        }
+        if entry.payload.get("type").and_then(|t| t.as_str()) != Some("item_completed") {
+            continue;
+        }
+        let item = match entry.payload.get("item") {
+            Some(item) if item.is_object() => item.clone(),
+            _ => continue,
+        };
+        let item_type = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if !is_desktop_item_tool_activity(item_type) {
+            continue;
+        }
+        items.push((index, item));
+    }
+
+    // call_id -> (payloads, owning turn_id)
+    let mut claims: HashMap<String, (Vec<Value>, String)> = HashMap::new();
+    let mut claimed: HashSet<usize> = HashSet::new();
+
+    for (item_index, payload) in &items {
+        // Prefer a tool call that precedes the item (Desktop's common ordering is
+        // `custom_tool_call` → `item_completed`), then fall back to one that follows it.
+        let matched = nearest_tool_call(entries, *item_index, true)
+            .or_else(|| nearest_tool_call(entries, *item_index, false));
+        if let Some((call_id, call_index)) = matched {
+            // At most two items per call: exec can emit a start and an end record.
+            let entry = claims.entry(call_id).or_insert_with(|| {
+                (
+                    Vec::new(),
+                    current_turn_id_for_entry(entries, call_index).unwrap_or_default(),
+                )
+            });
+            if entry.0.len() < 2 {
+                entry.0.push(payload.clone());
+                claimed.insert(*item_index);
+            }
+        }
+    }
+
+    // Apply correlations onto the finalized tool calls.
+    for (call_id, (payloads, turn_id)) in &claims {
+        if turn_id.is_empty() {
+            continue;
+        }
+        let Some(turn) = turns.get_mut(turn_id) else {
+            continue;
+        };
+        if let Some(tc) = turn.tool_calls.iter_mut().find(|tc| &tc.call_id == call_id) {
+            for payload in payloads {
+                let item_type = payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                if let Some(patch) = crate::parser::toolcall::desktop_item_patch(item_type, payload)
+                {
+                    patch.apply(tc);
+                }
+            }
+            // An item that classified a previously `Unknown` call makes that entry redundant;
+            // drop it the same way a real end event would.
+            if tc.kind != crate::parser::toolcall::ToolKind::Unknown {
+                turn.tool_calls.retain(|other| {
+                    !(other.call_id == *call_id
+                        && other.kind == crate::parser::toolcall::ToolKind::Unknown)
+                });
+            }
+        }
+    }
+
+    // Items with no adjacent response_item call materialize as their own tool call so no
+    // runtime evidence is lost (measured: 2 of 1512 items on 60 real sessions, both
+    // `CommandExecution`).
+    for (item_index, payload) in &items {
+        if claimed.contains(item_index) {
+            continue;
+        }
+        let Some(turn_id) = current_turn_id_for_entry(entries, *item_index) else {
+            continue;
+        };
+        let Some(turn) = turns.get_mut(&turn_id) else {
+            continue;
+        };
+        if let Some(standalone) = crate::parser::toolcall::desktop_item_standalone(payload) {
+            let order = call_order
+                .get(&standalone.call_id)
+                .copied()
+                .unwrap_or(usize::MAX);
+            turn.tool_call_orders.push(order);
+            turn.tool_calls.push(standalone);
+        }
+    }
+}
+
+/// True for `item_completed` item kinds that map onto tool activity.
+fn is_desktop_item_tool_activity(item_type: &str) -> bool {
+    matches!(
+        item_type,
+        "CommandExecution" | "FileChange" | "McpToolCall" | "WebSearch" | "ImageView" | "Extension"
+    )
+}
+
+/// Nearest tool-call entry to `item_index`, searching backward when `forward` is false.
+/// Returns the call_id and its entry index. Only offsets of 0/1 are accepted: Desktop emits
+/// the two representations back to back, and a wider window risks joining unrelated calls.
+fn nearest_tool_call(
+    entries: &[RawEntry],
+    item_index: usize,
+    backward: bool,
+) -> Option<(String, usize)> {
+    // Strict adjacency: Desktop emits the item and its tool call back to back (measured: 1510
+    // of 1512 mappable items are exactly one JSONL line apart). Anything further away belongs
+    // to a different call, so it must not be claimed.
+    let idx = if backward {
+        item_index.checked_sub(1)?
+    } else {
+        item_index + 1
+    };
+    let entry = entries.get(idx)?;
+    if entry.entry_type != "response_item" {
+        return None;
+    }
+    let payload_type = entry.payload.get("type").and_then(|t| t.as_str());
+    if !matches!(
+        payload_type,
+        Some("custom_tool_call") | Some("function_call")
+    ) {
+        return None;
+    }
+    call_id_of(entry).map(|call_id| (call_id, idx))
+}
+
+/// Resolve the turn that owns the entry at `item_index`, using the enclosing `task_started`.
+fn current_turn_id_for_entry(entries: &[RawEntry], item_index: usize) -> Option<String> {
+    entries[..=item_index].iter().rev().find_map(|entry| {
+        if entry.entry_type != "event_msg" {
+            return None;
+        }
+        if entry.payload.get("type").and_then(|t| t.as_str()) != Some("task_started") {
+            return None;
+        }
+        entry
+            .payload
+            .get("turn_id")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    })
 }
 
 /// Extract a tool call's `call_id` from a raw entry, checking both the parsed payload and the
@@ -4728,5 +4901,195 @@ mod tests {
         assert_eq!(turns[0].agent_messages[0].text, full_text);
         assert!(turns[0].agent_messages[0].text.len() > 256 * 1024);
         assert_eq!(turns[0].final_answer.as_deref(), Some(full_text.as_str()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Codex Desktop v0.153+ `event_msg.item_completed` correlation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn desktop_command_execution_item_enriches_adjacent_exec_call() {
+        // Desktop writes the exec twice: `custom_tool_call` carries the JavaScript the model
+        // ran, `item_completed.CommandExecution` carries what the runtime actually executed.
+        // Both must end up on one tool call instead of two.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-09-12T10:00:00Z","type":"session_meta","payload":{"id":"desktop-1","timestamp":"2026-09-12T10:00:00Z","cli_version":"0.153.3","originator":"Codex Desktop"}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"run it"}]}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:03Z","ordinal":4,"type":"response_item","payload":{"type":"custom_tool_call","status":"completed","call_id":"call_exec","name":"exec","input":"const r = await tools.exec_command({cmd: 'echo hi'}); text(r.output);"}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:04Z","ordinal":5,"type":"event_msg","payload":{"type":"item_completed","turn_id":"turn-1","item":{"type":"CommandExecution","id":"exec-abc","process_id":"123","command":["pwsh.exe","-Command","echo hi"],"cwd":"file:///D:/proj","parsed_cmd":[{"type":"unknown","cmd":"echo hi"}],"source":"unified_exec_startup","status":"completed","stdout":"hi\n","stderr":"","aggregated_output":"hi\n","exit_code":0,"duration":{"secs":1,"nanos":5000000}}}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:05Z","ordinal":6,"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_exec","output":[{"type":"input_text","text":"Script completed\nOutput:\nhi\n"}]}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1789207206.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].tool_calls.len(),
+            1,
+            "item_completed must enrich the adjacent call, not add a second one"
+        );
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.kind, ToolKind::ExecCommand);
+        assert_eq!(tool.exit_code, Some(0));
+        assert_eq!(tool.status, "completed");
+        assert_eq!(tool.desktop_item_id.as_deref(), Some("exec-abc"));
+        assert_eq!(
+            tool.command.as_deref(),
+            Some(
+                [
+                    "pwsh.exe".to_string(),
+                    "-Command".to_string(),
+                    "echo hi".to_string()
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(tool.cwd.as_deref(), Some("file:///D:/proj"));
+        // The response_item side provided the wrapper output, so it is kept verbatim.
+        assert!(tool.output.as_deref().unwrap().contains("Script completed"));
+        assert!(tool
+            .input_text
+            .as_deref()
+            .unwrap()
+            .contains("tools.exec_command"));
+        assert!(tool.arguments.get("parsed_cmd").is_some());
+    }
+
+    #[test]
+    fn desktop_file_change_item_attaches_unified_diff_to_adjacent_call() {
+        // FileChange carries the only copy of the unified diff in Desktop sessions; the
+        // response_item side just wraps the script output.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-09-12T10:00:00Z","type":"session_meta","payload":{"id":"desktop-2","timestamp":"2026-09-12T10:00:00Z","cli_version":"0.153.3"}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:02Z","ordinal":3,"type":"response_item","payload":{"type":"custom_tool_call","status":"completed","call_id":"call_patch","name":"exec","input":"await tools.apply_patch('*** Begin Patch...');"}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:03Z","ordinal":4,"type":"event_msg","payload":{"type":"item_completed","turn_id":"turn-1","item":{"type":"FileChange","id":"exec-patch-1","changes":{"D:\\proj\\src\\main.rs":{"type":"update","unified_diff":"@@ -1 +1 @@\n-old\n+new\n","move_path":null}},"status":"completed","stdout":"","stderr":""}}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:04Z","ordinal":5,"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"call_patch","output":[{"type":"input_text","text":"Script completed\nOutput:\n{}"}]}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:05Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1789207205.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.kind, ToolKind::PatchApply);
+        assert_eq!(tool.name, "apply_patch");
+        assert_eq!(tool.patch_success, Some(true));
+        let changes = tool.patch_changes.as_ref().unwrap();
+        assert!(changes.get("D:\\proj\\src\\main.rs").is_some());
+        assert!(changes["D:\\proj\\src\\main.rs"]["unified_diff"]
+            .as_str()
+            .unwrap()
+            .contains("+new"));
+    }
+
+    #[test]
+    fn desktop_command_execution_item_without_adjacent_call_becomes_standalone() {
+        // Two of 1512 items in a 60-session sample have no adjacent response_item call; the
+        // runtime record must still surface instead of being dropped.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-09-12T10:00:00Z","type":"session_meta","payload":{"id":"desktop-3","timestamp":"2026-09-12T10:00:00Z","cli_version":"0.153.3"}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:02Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"go"}]}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:03Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"turn-1","item":{"type":"CommandExecution","id":"exec-solo","command":["git","status"],"cwd":"D:\\proj","status":"failed","stdout":"","stderr":"boom\n","exit_code":128,"parsed_cmd":[]}}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:04Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1789207204.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        let tool = &turns[0].tool_calls[0];
+        assert_eq!(tool.kind, ToolKind::ExecCommand);
+        assert_eq!(tool.exit_code, Some(128));
+        assert_eq!(tool.status, "failed");
+        assert_eq!(tool.call_id, "exec-solo");
+        assert_eq!(tool.desktop_item_id.as_deref(), Some("exec-solo"));
+        assert_eq!(tool.stderr.as_deref(), Some("boom\n"));
+        // No response_item output existed, so stderr is the only available body.
+        assert_eq!(tool.output.as_deref(), Some("boom\n"));
+    }
+
+    #[test]
+    fn desktop_two_calls_map_to_their_own_adjacent_items() {
+        // Adjacency must not pair the second item with the first call.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-09-12T10:00:00Z","type":"session_meta","payload":{"id":"desktop-4","timestamp":"2026-09-12T10:00:00Z","cli_version":"0.153.3"}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:02Z","ordinal":2,"type":"response_item","payload":{"type":"custom_tool_call","status":"completed","call_id":"call_a","name":"exec","input":"// A"}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:03Z","ordinal":3,"type":"event_msg","payload":{"type":"item_completed","turn_id":"turn-1","item":{"type":"CommandExecution","id":"exec-a","command":["echo","A"],"status":"completed","stdout":"A\n","stderr":"","exit_code":0}}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:04Z","ordinal":4,"type":"response_item","payload":{"type":"custom_tool_call","status":"completed","call_id":"call_b","name":"exec","input":"// B"}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:05Z","ordinal":5,"type":"event_msg","payload":{"type":"item_completed","turn_id":"turn-1","item":{"type":"CommandExecution","id":"exec-b","command":["echo","B"],"status":"completed","stdout":"B\n","stderr":"","exit_code":1}}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:06Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1789207206.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        for tc in &turns[0].tool_calls {
+            println!(
+                "DEBUG tc call_id={} kind={:?} desktop_item_id={:?} exit={:?}",
+                tc.call_id, tc.kind, tc.desktop_item_id, tc.exit_code
+            );
+        }
+        assert_eq!(turns[0].tool_calls.len(), 2);
+        let a = turns[0]
+            .tool_calls
+            .iter()
+            .find(|tc| tc.call_id == "call_a")
+            .expect("call_a present");
+        let b = turns[0]
+            .tool_calls
+            .iter()
+            .find(|tc| tc.call_id == "call_b")
+            .expect("call_b present");
+        assert_eq!(a.desktop_item_id.as_deref(), Some("exec-a"));
+        assert_eq!(a.exit_code, Some(0));
+        assert_eq!(b.desktop_item_id.as_deref(), Some("exec-b"));
+        assert_eq!(b.exit_code, Some(1));
+    }
+
+    #[test]
+    fn desktop_informational_items_do_not_create_tool_calls() {
+        // Reasoning / AgentMessage / UserMessage / ContextCompaction are already represented by
+        // dedicated parser paths; mapping them again would duplicate the transcript.
+        let entries = entries(&[
+            r#"{"timestamp":"2026-09-12T10:00:00Z","type":"session_meta","payload":{"id":"desktop-5","timestamp":"2026-09-12T10:00:00Z","cli_version":"0.153.3"}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:02Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"turn-1","item":{"type":"UserMessage","id":"msg-u","content":[{"type":"text","text":"hello"}]}}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:03Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:04Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"turn-1","item":{"type":"Reasoning","id":"rs-1"}}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:05Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"turn-1","item":{"type":"AgentMessage","id":"msg-a","content":[{"type":"Text","text":"done"}]}}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:06Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"turn-1","item":{"type":"ContextCompaction","id":"cmp-1"}}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:07Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"turn-1","item":{"type":"SubAgentActivity","id":"call_x","kind":"started","agent_thread_id":"t","agent_path":"/root/a"}}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:08Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1789207208.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns.len(), 1);
+        assert!(
+            turns[0].tool_calls.is_empty(),
+            "informational items must not become tool calls, got {:?}",
+            turns[0]
+                .tool_calls
+                .iter()
+                .map(|tc| (&tc.call_id, &tc.kind))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(turns[0].user_message.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn desktop_web_search_item_maps_to_web_search_call() {
+        let entries = entries(&[
+            r#"{"timestamp":"2026-09-12T10:00:00Z","type":"session_meta","payload":{"id":"desktop-6","timestamp":"2026-09-12T10:00:00Z","cli_version":"0.153.3"}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:01Z","type":"event_msg","payload":{"type":"task_started","turn_id":"turn-1"}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:02Z","type":"event_msg","payload":{"type":"item_completed","turn_id":"turn-1","item":{"type":"WebSearch","id":"ws_1","query":"codex-trace","action":{"type":"search","query":"codex-trace","queries":["codex-trace"]}}}}"#,
+            r#"{"timestamp":"2026-09-12T10:00:03Z","type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-1","completed_at":1789207203.0}}"#,
+        ]);
+
+        let turns = build_turns(&entries);
+        assert_eq!(turns[0].tool_calls.len(), 1);
+        assert_eq!(turns[0].tool_calls[0].kind, ToolKind::WebSearch);
+        assert_eq!(
+            turns[0].tool_calls[0].web_query.as_deref(),
+            Some("codex-trace")
+        );
     }
 }

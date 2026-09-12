@@ -77,6 +77,16 @@ pub struct ToolCall {
     /// is partial; None means no truncation field was present (pre-v0.145.0 or unaffected run).
     #[serde(default)]
     pub output_truncated: Option<bool>,
+    /// Codex Desktop v0.153+ records tool activity in `event_msg.item_completed` in addition to
+    /// `response_item`. When the two streams are correlated, this holds the item's own id
+    /// (e.g. `exec-<uuid>`) so the originating item stays traceable. None for CLI sessions and
+    /// for items that could not be correlated.
+    #[serde(default)]
+    pub desktop_item_id: Option<String>,
+    /// Codex Desktop v0.153+ `CommandExecution` items carry stderr separately from stdout.
+    /// None when the item has no stderr or the session predates the item_completed stream.
+    #[serde(default)]
+    pub stderr: Option<String>,
 }
 
 /// A pending (not yet finalized) tool call — waiting for its end event.
@@ -219,6 +229,8 @@ impl ToolCallBuilder {
                 subagent_id: None,
                 subagent_name: None,
                 output_truncated: None,
+                desktop_item_id: None,
+                stderr: None,
             });
         }
     }
@@ -334,6 +346,8 @@ impl ToolCallBuilder {
                     subagent_id: None,
                     subagent_name: None,
                     output_truncated: None,
+                    desktop_item_id: None,
+                    stderr: None,
                 });
                 return;
             }
@@ -365,6 +379,8 @@ impl ToolCallBuilder {
                     subagent_id: None,
                     subagent_name: None,
                     output_truncated: None,
+                    desktop_item_id: None,
+                    stderr: None,
                 });
                 return;
             }
@@ -406,6 +422,8 @@ impl ToolCallBuilder {
                     subagent_id: None,
                     subagent_name: None,
                     output_truncated: None,
+                    desktop_item_id: None,
+                    stderr: None,
                 });
                 return;
             }
@@ -448,6 +466,8 @@ impl ToolCallBuilder {
                     subagent_id: None,
                     subagent_name: None,
                     output_truncated: None,
+                    desktop_item_id: None,
+                    stderr: None,
                 });
                 return;
             }
@@ -482,6 +502,8 @@ impl ToolCallBuilder {
                     subagent_id: None,
                     subagent_name: None,
                     output_truncated: None,
+                    desktop_item_id: None,
+                    stderr: None,
                 });
                 return;
             }
@@ -561,6 +583,8 @@ impl ToolCallBuilder {
                 subagent_id: None,
                 subagent_name: None,
                 output_truncated: None,
+                desktop_item_id: None,
+                stderr: None,
             });
         }
     }
@@ -716,6 +740,8 @@ impl ToolCallBuilder {
             subagent_id,
             subagent_name,
             output_truncated,
+            desktop_item_id: None,
+            stderr: None,
         });
     }
 
@@ -798,6 +824,8 @@ impl ToolCallBuilder {
             subagent_id,
             subagent_name,
             output_truncated: None,
+            desktop_item_id: None,
+            stderr: None,
         });
     }
 
@@ -888,6 +916,8 @@ impl ToolCallBuilder {
             subagent_id,
             subagent_name,
             output_truncated: None,
+            desktop_item_id: None,
+            stderr: None,
         });
     }
 
@@ -924,6 +954,8 @@ impl ToolCallBuilder {
             subagent_id,
             subagent_name,
             output_truncated: None,
+            desktop_item_id: None,
+            stderr: None,
         });
     }
 
@@ -960,6 +992,8 @@ impl ToolCallBuilder {
             subagent_id,
             subagent_name,
             output_truncated: None,
+            desktop_item_id: None,
+            stderr: None,
         });
     }
 
@@ -996,6 +1030,8 @@ impl ToolCallBuilder {
             subagent_id,
             subagent_name,
             output_truncated: None,
+            desktop_item_id: None,
+            stderr: None,
         });
     }
 
@@ -1041,6 +1077,8 @@ impl ToolCallBuilder {
             subagent_id,
             subagent_name,
             output_truncated: None,
+            desktop_item_id: None,
+            stderr: None,
         });
     }
 
@@ -1096,6 +1134,8 @@ impl ToolCallBuilder {
             subagent_id,
             subagent_name,
             output_truncated: None,
+            desktop_item_id: None,
+            stderr: None,
         });
     }
 
@@ -1154,6 +1194,8 @@ impl ToolCallBuilder {
             subagent_id,
             subagent_name,
             output_truncated: None,
+            desktop_item_id: None,
+            stderr: None,
         });
     }
 
@@ -1187,11 +1229,19 @@ impl ToolCallBuilder {
                 subagent_id: None,
                 subagent_name: None,
                 output_truncated: None,
+                desktop_item_id: None,
+                stderr: None,
             });
         }
         // Remove Unknown entries that share a call_id with a properly classified end-event entry.
         // This happens when function_call_output arrives before exec_command_end for the same
         // call_id — the output is finalized as Unknown first, then the end event adds the real entry.
+        self.drop_superseded_unknowns();
+    }
+
+    /// Remove `Unknown` entries whose call_id was later classified by a real end event or by a
+    /// correlated Desktop `item_completed`. Keeps unclassified calls visible.
+    pub fn drop_superseded_unknowns(&mut self) {
         let paired: HashSet<String> = self
             .finalized
             .iter()
@@ -1201,6 +1251,323 @@ impl ToolCallBuilder {
         self.finalized
             .retain(|tc| tc.kind != ToolKind::Unknown || !paired.contains(&tc.call_id));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Codex Desktop `event_msg.item_completed` mapping (v0.153+)
+// ---------------------------------------------------------------------------
+
+/// Normalized view of one Desktop `item_completed` item, described as a patch over a tool call.
+///
+/// Desktop writes the same logical tool invocation to two streams (`response_item` and
+/// `item_completed`). Everything below is `Option` so that applying an item never clobbers
+/// information the `response_item` side already provided (notably `input_text`, which holds the
+/// raw JavaScript the model ran).
+#[derive(Debug, Clone, Default)]
+pub struct DesktopItemPatch {
+    item_type: String,
+    item_id: Option<String>,
+    kind: Option<ToolKind>,
+    name: Option<String>,
+    command: Option<Vec<String>>,
+    cwd: Option<String>,
+    status: Option<String>,
+    exit_code: Option<i32>,
+    stdout: Option<String>,
+    stderr: Option<String>,
+    duration_secs: Option<f64>,
+    /// `parsed_cmd` from CommandExecution, kept as structured arguments.
+    parsed_cmd: Option<Value>,
+    mcp_server: Option<String>,
+    mcp_tool: Option<String>,
+    plugin_id: Option<String>,
+    web_query: Option<String>,
+    image_path: Option<String>,
+    patch_success: Option<bool>,
+    patch_changes: Option<Value>,
+}
+
+impl DesktopItemPatch {
+    /// Apply onto an existing (already finalized) tool call.
+    pub fn apply(self, tc: &mut ToolCall) {
+        if let Some(kind) = self.kind {
+            tc.kind = kind;
+        }
+        if let Some(name) = self.name {
+            if !name.is_empty() {
+                tc.name = name;
+            }
+        }
+        if self.command.is_some() {
+            tc.command = self.command;
+        }
+        if self.cwd.is_some() {
+            tc.cwd = self.cwd;
+        }
+        if let Some(status) = self.status {
+            if !status.is_empty() {
+                tc.status = status;
+            }
+        }
+        if self.exit_code.is_some() {
+            tc.exit_code = self.exit_code;
+        }
+        // `output` from the response_item side is the script wrapper ("Script completed ...
+        // Output: ..."). Only fall back to the item's stdout when nothing was captured, so the
+        // wrapper text is preserved instead of silently replaced.
+        if tc.output.is_none() {
+            tc.output = self.stdout.or_else(|| self.stderr.clone());
+        }
+        if self.stderr.is_some() {
+            tc.stderr = self.stderr;
+        }
+        if self.duration_secs.is_some() {
+            tc.duration_secs = self.duration_secs;
+        }
+        if self.mcp_server.is_some() {
+            tc.mcp_server = self.mcp_server;
+        }
+        if self.mcp_tool.is_some() {
+            tc.mcp_tool = self.mcp_tool;
+        }
+        if self.plugin_id.is_some() {
+            tc.plugin_id = self.plugin_id;
+        }
+        if self.web_query.is_some() {
+            tc.web_query = self.web_query;
+        }
+        if self.image_path.is_some() {
+            tc.image_file_path = self.image_path;
+        }
+        if self.patch_success.is_some() {
+            tc.patch_success = self.patch_success;
+        }
+        if self.patch_changes.is_some() {
+            tc.patch_changes = self.patch_changes;
+        }
+        // Fold the structured command into `arguments` without discarding response_item data.
+        if let Some(parsed) = self.parsed_cmd {
+            let mut args = match std::mem::take(&mut tc.arguments) {
+                Value::Object(map) => map,
+                other => {
+                    tc.arguments = other;
+                    serde_json::Map::new()
+                }
+            };
+            args.entry("parsed_cmd".to_string()).or_insert(parsed);
+            tc.arguments = Value::Object(args);
+        }
+        tc.desktop_item_id = self.item_id;
+    }
+
+    /// Materialize the item as a standalone tool call when no adjacent `response_item` call
+    /// exists. Returns None for informational item kinds that carry no tool activity
+    /// (`Reasoning`, `AgentMessage`, `UserMessage`, `ContextCompaction`, `SubAgentActivity`,
+    /// `CollabAgentToolCall`) — those are already represented by other parser paths.
+    pub fn into_standalone(self) -> Option<ToolCall> {
+        let kind = self.kind.clone()?;
+        if matches!(kind, ToolKind::Unknown) {
+            return None;
+        }
+        let item_id = self.item_id.clone().unwrap_or_default();
+        let name = self
+            .name
+            .clone()
+            .unwrap_or_else(|| self.item_type.to_lowercase());
+        Some(ToolCall {
+            call_id: item_id.clone(),
+            kind,
+            name,
+            arguments: self.parsed_cmd.unwrap_or(Value::Null),
+            input_text: None,
+            output: self.stdout.or_else(|| self.stderr.clone()),
+            exit_code: self.exit_code,
+            command: self.command,
+            cwd: self.cwd,
+            duration_secs: self.duration_secs,
+            mcp_server: self.mcp_server,
+            mcp_tool: self.mcp_tool,
+            plugin_id: self.plugin_id,
+            script_path: None,
+            patch_success: self.patch_success,
+            patch_changes: self.patch_changes,
+            web_query: self.web_query,
+            web_url: None,
+            image_prompt: None,
+            image_file_path: self.image_path,
+            worker_session: None,
+            status: self.status.unwrap_or_else(|| "completed".to_string()),
+            subagent_id: None,
+            subagent_name: None,
+            output_truncated: None,
+            desktop_item_id: self.item_id,
+            stderr: self.stderr,
+        })
+    }
+}
+
+/// Map one `item_completed.item` value to a [`DesktopItemPatch`].
+///
+/// Returns None for item kinds that carry no tool activity of their own.
+pub fn desktop_item_patch(item_type: &str, item: &Value) -> Option<DesktopItemPatch> {
+    let item_id = item
+        .get("id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let status = item
+        .get("status")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let stdout = non_empty_str(item, "stdout").or_else(|| non_empty_str(item, "aggregated_output"));
+    let stderr = non_empty_str(item, "stderr");
+
+    let patch = match item_type {
+        "CommandExecution" => {
+            let command = item.get("command").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter()
+                    .map(|v| v.as_str().unwrap_or_default().to_string())
+                    .collect::<Vec<String>>()
+            });
+            // Desktop records the runtime's own source for the command (e.g.
+            // "unified_exec_startup"); keep it visible in the call name when present.
+            let name = non_empty_str(item, "source").unwrap_or_else(|| "exec".to_string());
+            DesktopItemPatch {
+                item_type: item_type.to_string(),
+                item_id,
+                kind: Some(ToolKind::ExecCommand),
+                name: Some(name),
+                command,
+                cwd: non_empty_str(item, "cwd"),
+                status,
+                exit_code: item
+                    .get("exit_code")
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v as i32),
+                stdout,
+                stderr,
+                duration_secs: parse_duration(item),
+                parsed_cmd: item.get("parsed_cmd").cloned(),
+                mcp_server: None,
+                mcp_tool: None,
+                plugin_id: None,
+                web_query: None,
+                image_path: None,
+                patch_success: None,
+                patch_changes: None,
+            }
+        }
+        "FileChange" => {
+            let changes = item.get("changes").cloned();
+            let has_stderr = stderr.is_some();
+            let patch_success = match status.as_deref() {
+                Some("completed") | Some("success") | Some("succeeded") => Some(true),
+                Some("failed") | Some("error") => Some(false),
+                // stderr without stdout is Codex's signal for a rejected patch.
+                _ if has_stderr && stdout.is_none() => Some(false),
+                _ => None,
+            };
+            DesktopItemPatch {
+                item_type: item_type.to_string(),
+                item_id,
+                kind: Some(ToolKind::PatchApply),
+                name: Some("apply_patch".to_string()),
+                command: None,
+                cwd: None,
+                status,
+                exit_code: None,
+                stdout,
+                stderr,
+                duration_secs: None,
+                parsed_cmd: None,
+                mcp_server: None,
+                mcp_tool: None,
+                plugin_id: None,
+                web_query: None,
+                image_path: None,
+                patch_success,
+                patch_changes: changes,
+            }
+        }
+        "McpToolCall" => DesktopItemPatch {
+            item_type: item_type.to_string(),
+            item_id,
+            kind: Some(ToolKind::McpTool),
+            name: non_empty_str(item, "tool"),
+            command: None,
+            cwd: None,
+            status,
+            exit_code: None,
+            stdout,
+            stderr: stderr.or_else(|| non_empty_str(item, "error")),
+            duration_secs: parse_duration(item),
+            parsed_cmd: None,
+            mcp_server: non_empty_str(item, "server"),
+            mcp_tool: non_empty_str(item, "tool"),
+            plugin_id: non_empty_str(item, "pluginId"),
+            web_query: None,
+            image_path: None,
+            patch_success: None,
+            patch_changes: None,
+        },
+        "WebSearch" => DesktopItemPatch {
+            item_type: item_type.to_string(),
+            item_id,
+            kind: Some(ToolKind::WebSearch),
+            name: Some("web_search".to_string()),
+            web_query: non_empty_str(item, "query"),
+            status: Some("completed".to_string()),
+            ..DesktopItemPatch::default()
+        },
+        // Desktop records web search under `Extension{kind:"web.search"}` as well as under the
+        // dedicated `WebSearch` item; both carry the query and result list.
+        "Extension" if item.get("kind").and_then(|v| v.as_str()) == Some("web.search") => {
+            DesktopItemPatch {
+                item_type: item_type.to_string(),
+                item_id,
+                kind: Some(ToolKind::WebSearch),
+                name: Some("web_search".to_string()),
+                web_query: non_empty_str(item, "query"),
+                status: Some("completed".to_string()),
+                ..DesktopItemPatch::default()
+            }
+        }
+        "ImageView" => DesktopItemPatch {
+            item_type: item_type.to_string(),
+            item_id,
+            kind: Some(ToolKind::ImageGeneration),
+            name: Some("image_view".to_string()),
+            image_path: non_empty_str(item, "path"),
+            status: Some("completed".to_string()),
+            ..DesktopItemPatch::default()
+        },
+        // Informational items already represented by other parser paths.
+        "Reasoning"
+        | "AgentMessage"
+        | "UserMessage"
+        | "ContextCompaction"
+        | "SubAgentActivity"
+        | "CollabAgentToolCall"
+        | "Extension" => return None,
+        _ => return None,
+    };
+
+    Some(patch)
+}
+
+fn non_empty_str(v: &Value, key: &str) -> Option<String> {
+    v.get(key)
+        .and_then(|x| x.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+}
+
+/// Map one `item_completed` item value to a standalone tool call, for items that have no
+/// adjacent `response_item` tool call to enrich. Returns None for informational item kinds.
+pub fn desktop_item_standalone(item: &Value) -> Option<ToolCall> {
+    let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    desktop_item_patch(item_type, item)?.into_standalone()
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1249,6 +1616,8 @@ fn exec_tool_call_from_pending(
         subagent_id: None,
         subagent_name: None,
         output_truncated: None,
+        desktop_item_id: None,
+        stderr: None,
     }
 }
 
