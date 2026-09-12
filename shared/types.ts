@@ -160,6 +160,13 @@ export interface CodexToolCall {
   status: string;
   /** Codex v0.145.0: true when exec_command_end signals that aggregated_output was clipped by the runtime's output limit. Null for pre-v0.145.0 sessions and non-exec tool calls. */
   output_truncated: boolean | null;
+  /** Codex Desktop v0.153+ records tool activity in `event_msg.item_completed` as well as in
+   * `response_item`. When the two streams were correlated, this carries the item's own id
+   * (e.g. `exec-<uuid>`). Null for CLI sessions and uncorrelated items. */
+  desktop_item_id?: string | null;
+  /** Codex Desktop v0.153+ `CommandExecution` items carry stderr separately from stdout.
+   * Null when the item has no stderr or the session predates the item_completed stream. */
+  stderr?: string | null;
 }
 
 export interface CodexTurn {
