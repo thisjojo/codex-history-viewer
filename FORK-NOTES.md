@@ -33,9 +33,13 @@ P0 技术验证已完成，结论 **GO**。完整记录见父项目
 | 严格只读 | 静态样本 hash 全等，Codex 数据零 mutation，生产代码只写 app 自身 settings.json |
 | Windows 构建与运行 | 原生窗口正常，410 Rust 测试 + 175 前端测试通过 |
 
-## 3. P1 必须处理的前置项
+## 3. P1 前置项：已全部实施（合并于 `main`）
 
-### C1（阻塞 V1 验收）：补 `event_msg.item_completed` 兼容层
+以下四项在 P0 结论为 GO 时被列为前置条件，均已实现、复验并合并进 `main`。
+每个条目标注了实现位置；详细验收数据在父项目 `validation/P0-验证记录.md` 与
+`validation/evidence/`。
+
+### C1 ✔ 已实现：补 `event_msg.item_completed` 兼容层
 
 **问题**：Codex Desktop v0.153/v0.154 的会话把工具与文件变更记录在
 `event_msg.item_completed`，上游 parser 完全不读该事件族，导致：
@@ -44,46 +48,79 @@ P0 技术验证已完成，结论 **GO**。完整记录见父项目
 - `item_completed.FileChange`（949 条）→ **完全没有 patch 记录**，unified diff 丢失
 - 现有 `custom_tool_call` 只有 JS 源码（`input_text`）与脚本包装输出，拿不到真实 diff
 
-**要求**：
+**实现**（`src-tauri/src/parser/toolcall.rs`、`turn.rs`）：`desktop_item_patch()` 把 item 归一化，
+`fold_desktop_items()` 按**严格入口邻接**（entry index ± 1）关联到 `response_item` 工具调用
+（实测 175 文件中 1510/1512 个 item 恰好相隔一行）；无邻接调用的 item 独立成条；
+`Reasoning`/`AgentMessage`/`UserMessage`/`ContextCompaction`/`SubAgentActivity`/`CollabAgentToolCall`
+显式跳过。`ToolCall` 增加 `desktop_item_id`、`stderr`。
 
-- `CommandExecution` → exec 类 tool call，携带 `command`/`parsed_cmd`/`status`/`stdout`/`stderr`/`exit_code`
-- `FileChange` → patch 类 tool call，携带 `changes[*].unified_diff`、`move_path`、文件列表
-- 其余（`McpToolCall`/`WebSearch`/`ImageView`/`Extension`/`ContextCompaction`/`SubAgentActivity`/`CollabAgentToolCall`）
-  补全或显式记账忽略
-- **不得**改动既有 `response_item` 路径的语义；不得破坏上游 parser 测试与 fixtures
+**验收结果**：`patch_apply` 949（原 0）、`exec_command` 2,346（原 0），与原始事件一一对应；
+exec 全部携带 `exit_code`/`command`；恢复 655 条 unified diff；上游 410 个测试原样通过。
 
-**验收**：用父项目的 `validation/scripts/p0_parser_matrix.py` 复跑真实样本，
-要求解析出的 `patch_apply`/`exec` 计数与原始 `FileChange`/`CommandExecution` 计数匹配（差异需能解释）。
+### C6 ✔ 已实现：patch 渲染使用 `patch_changes[*].unified_diff`
 
-### C4：dev 端口可配置
+**问题**：UI 先用 `input_text` 走 `parseApplyPatch()`，而 Desktop 的 `input_text` 是模型运行的
+JavaScript（补丁被包在 JS 字符串里），解析失败后回退为等宽文本——即使 C1 已把 diff 数据补齐，
+界面也没有红绿 diff。既有单测用的是裸补丁文本，该形态在真实 Desktop 数据里并不出现。
+
+**实现**（`shared/patch.ts`、`src/components/ToolCallItem.tsx`）：新增 `parseUnifiedDiff()`
+把标准 unified diff 解析为与 `parseApplyPatch` 相同的 `PatchFile[]`/hunks（复用 `groupRuns` +
+`segmentize` 得到词级高亮）；渲染来源改为有优先级——`patch_changes` 优先，`input_text` 兜底。
+
+**验收结果**：Desktop `FileChange` patch 渲染出 added 13 / removed 1（原 0/0）、
+CLI 风格 patch added 12 / removed 12，词级高亮生效。
+
+### C4 ✔ 已实现：dev 端口可配置
 
 本机实测 1420/1421 落在 Windows 保留端口区间（`netsh int ipv4 show excludedportrange protocol=tcp`
 列出 1353–1452），`npm run tauri dev` 的 Vite 阶段直接 `EACCES`。
-需要让 dev 端口可通过环境变量配置，并让 `build.devUrl` 与之保持一致。
 
-### C5：cwd 归一化的 Unicode Cf 策略
+**实现**（`script/dev.mjs` + `npm run dev:desktop`）：探测第一个可绑定端口 → 在该端口启动 Vite →
+生成 `.tauri/dev-url.json` 配置覆盖（设 `devUrl`、清空 `beforeDevCommand`，避免 Tauri 再起一个 Vite）
+→ 启动 Tauri。`--port <n>` 可指定起点。`tauri.conf.json` 未被修改。
 
-真实数据中 1 个 cwd 目录名含不可见 `U+200C`（116 个会话）。ProjectResolver 必须明确
-是否剥离 Unicode 格式控制字符（Cf），并加测试。参考数据见父项目
-`validation/evidence/E-008-cwd-analysis.json`。
+### C5 ✔ 已实现：cwd 归一化的 Unicode Cf 策略
 
-### C3（可推迟到 P5）：远端图片与 CSP 硬化
+真实数据中 1 个 cwd 目录名含不可见 `U+200C`（116 个会话）。Windows 视其为独立目录，
+但它不显示，朴素归一化要么合并两个不同项目、要么把同一项目裂成两个。
 
-`![x](https://…)` 会渲染为 `<img>`，且 `src-tauri/tauri.conf.json` 中 `app.security.csp = null`，
-导致查看历史即触发外部请求。改为点击后加载 + 设置 CSP。
+**实现**（`shared/projectKey.ts`）：`projectKeyFor()` / `compareProjectPaths()` 返回
+`exact | cf | none`。`key` 保留 Cf 字符并归一化分隔符/尾部斜杠/`.`/`..`/Windows 大小写；
+`displayKey` 去掉 Cf 字符供「按可见目录合并」使用；`cfStripped` 报告是否发生了这种合并。
+POSIX 形态（WSL）保持大小写敏感且与 Windows 路径永不合并。
 
-## 4. 本地环境要求（本机已验证）
+### C3 ✔ 已实现（渲染层）：远端图片点击加载 + CSP
+
+**实现**：`MarkdownRenderer` 覆写 `img`——远端源先渲染占位按钮（显示 alt 与 URL），
+点击后才设置 `src`；`data:`/`blob:` 与同源/相对路径直接渲染。新增 `urlTransform` 仅对图片放行
+`data:image/*` 与 `blob:`（react-markdown 默认过滤器会把 `data:` 一并剥掉）。
+`src-tauri/tauri.conf.json` 的 `csp` 由 `null` 换为显式策略。
+
+**未独立复验**：CSP 由 Tauri 在运行时注入，无法从 `dist/index.html` 读回，其拦截行为未单独观测。
+已验证的是：策略已配置、应用在策略下正常渲染、渲染层不再请求远端图片。
+
+## 4. 本地开发命令（本机已验证）
+
+```bash
+npm run dev:desktop      # 桌面版：自动选可用端口（见上文 C4）
+npm run dev:web          # web 模式
+npm run check            # 上游全量检查（tsc/oxlint/oxfmt/clippy/fmt/vitest/cargo test）
+pwsh -File script/dev-check.ps1 all   # 同上，但自动补齐本机 Rust/MSVC 环境
+```
+
+## 5. 本地环境要求（本机已验证）
 
 - Node v24.19.0 / npm 11.17.0
 - Rust 1.98.1（`%USERPROFILE%\.cargo`），**PATH 需手动添加** `%USERPROFILE%\.cargo\bin`
-- MSVC BuildTools 2022 + Windows SDK 10.0.26100.0；链接需要显式 `LIB`/`INCLUDE`：
+- MSVC BuildTools 2022 + Windows SDK 10.0.26100.0；本机 vcvars 未注册 `WindowsSDKVersion`，
+  直接链接会 `LNK1181`，因此仓库内 `.cargo/config.toml` 固定了 `LIB`/`INCLUDE`：
   ```powershell
   $env:LIB = "C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\14.44.35207\lib\x64;C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\ucrt\x64;C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\um\x64;C:\Program Files (x86)\Windows Kits\10\Lib\10.0.26100.0\shared\x64"
   ```
 - `cargo test` 需要 `$env:HOME = $env:USERPROFILE`（Windows 无 HOME，上游个别测试硬编码该变量）
 - WebView2 Runtime 152.0.4191.66
 
-## 5. 上游约定（来自上游 AGENTS.md）
+## 6. 上游约定（来自上游 AGENTS.md）
 
 改动后必须跑：
 
@@ -94,10 +131,15 @@ cargo clippy --manifest-path src-tauri/Cargo.toml -- -D warnings
 cargo test --manifest-path src-tauri/Cargo.toml
 ```
 
-注意：本机 `oxfmt --check` 会把 93 个文件报为格式问题，这是 `core.autocrlf=true`
-把 checkout 转成 CRLF 导致的误报（已在父项目用 LF clone 证伪），不是代码问题。
+两个本机注意点：
 
-## 6. 许可
+- `oxfmt --check` 会把约 92 个**未改动**文件报为格式问题，这是 `core.autocrlf=true`
+  把 checkout 转成 CRLF 导致的误报（已在父项目用 LF clone 证伪），不是代码问题。
+  另外 `npx oxfmt`（不带 `--check`）会重写这些文件的行尾，提交前需 `git checkout` 排除。
+- 合并 `main` 后的验证结果：`tsc`/`oxlint`（3 条既有警告）/`vite build`/`clippy`/`fmt` 全部通过，
+  `vitest` 204 passed，`cargo test` 416 passed。
+
+## 7. 许可
 
 保留上游 MIT `LICENSE` 与版权声明（Copyright (c) 2025 Yang Liu）。
 本仓库的修改历史独立维护，不修改上游许可文本。
