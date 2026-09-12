@@ -79,6 +79,12 @@ npm install
 
 npm run tauri dev        # desktop app with hot reload
 npm run dev:web          # web mode (opens browser)
+
+# If `npm run tauri dev` fails with EACCES on the frontend port, the OS has reserved it
+# (Windows: check `netsh int ipv4 show excludedportrange protocol=tcp`). Pick a free port
+# automatically instead:
+npm run dev:desktop      # desktop app, frontend port chosen at runtime
+npm run dev:desktop -- --port 8123   # or force a starting port
 ```
 
 ### Run in Docker

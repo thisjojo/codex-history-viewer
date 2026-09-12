@@ -3560,3 +3560,34 @@ body {
   color: var(--text-secondary);
   margin-left: auto;
 }
+
+/* Remote markdown images are not fetched until the reader clicks (see MarkdownRenderer). */
+.md-image-gate {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  max-width: 520px;
+  margin: 6px 0;
+  padding: 8px 10px;
+  text-align: left;
+  font: inherit;
+  font-size: 12px;
+  color: var(--text-secondary, #9aa0a6);
+  background: var(--bg-inset, rgba(255, 255, 255, 0.04));
+  border: 1px dashed var(--border-subtle, rgba(255, 255, 255, 0.2));
+  border-radius: 4px;
+  cursor: pointer;
+}
+.md-image-gate:hover {
+  border-style: solid;
+  color: var(--text-primary, #e8eaed);
+}
+.md-image-gate__label {
+  font-weight: 600;
+}
+.md-image-gate__src {
+  font-family: var(--font-mono, monospace);
+  word-break: break-all;
+  opacity: 0.8;
+}
