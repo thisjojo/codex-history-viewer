@@ -68,6 +68,9 @@ function probePort(port) {
 async function pickPort(first) {
   for (let port = first; port < first + MAX_PORT_TRIES; port++) {
     if (port > 65535) break;
+    // Sequential on purpose: the goal is the *first* usable port, so probing the remaining
+    // candidates in parallel would only waste sockets.
+    // oxlint-disable-next-line no-await-in-loop
     if (await probePort(port)) return port;
   }
   throw new Error(`no free port found in ${first}..${first + MAX_PORT_TRIES}`);
@@ -76,6 +79,7 @@ async function pickPort(first) {
 // Poll the port until the dev server answers, so Tauri opens the window once the frontend is up.
 async function waitForPort(port, timeoutMs = 60000, child) {
   const deadline = Date.now() + timeoutMs;
+  /* oxlint-disable no-await-in-loop -- polling loop: each attempt must follow the previous one */
   while (Date.now() < deadline) {
     if (child && child.exitCode !== null) {
       throw new Error(`dev server exited early with code ${child.exitCode}`);
@@ -94,6 +98,7 @@ async function waitForPort(port, timeoutMs = 60000, child) {
     if (reachable) return;
     await new Promise((r) => setTimeout(r, 200));
   }
+  /* oxlint-enable no-await-in-loop */
   throw new Error(`dev server did not start listening on ${port} within ${timeoutMs}ms`);
 }
 
