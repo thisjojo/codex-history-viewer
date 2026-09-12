@@ -150,7 +150,16 @@ export interface CodexToolCall {
   /** Codex v0.134.0+ (PR #22882): subagent human-readable name from hook input identity fields. Null for parent-agent calls and pre-v0.134.0 sessions. */
   subagent_name: string | null;
   patch_success: boolean | null;
-  patch_changes: Record<string, { type: string; content?: string; unified_diff?: string }> | null;
+  patch_changes: Record<
+    string,
+    {
+      type: string;
+      content?: string;
+      unified_diff?: string;
+      /** Codex Desktop v0.153+ `FileChange` entries carry the rename destination here. */
+      move_path?: string | null;
+    }
+  > | null;
   web_query: string | null;
   web_url: string | null;
   image_prompt: string | null;
